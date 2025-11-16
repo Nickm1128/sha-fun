@@ -70,6 +70,7 @@ def refine_dataset_with_model(estimator, inputs, targets):
     preds = estimator.predict(inputs).astype(np.float32, copy=False)
     if preds.ndim == 2:
         preds = preds.reshape((-1, 64, 8))
+    # channel 0 holds the baseline state grid; later channels (if any) are metadata (e.g., stage id)
     baseline = inputs[..., :8, 0]
     refined = baseline + preds
     refined = np.clip(refined, -1.0, 1.0)
@@ -77,6 +78,21 @@ def refine_dataset_with_model(estimator, inputs, targets):
     new_inputs[..., :8, 0] = refined
     new_residuals = targets - refined
     return new_inputs, new_residuals, targets
+
+
+def _set_stage_channel(inputs: np.ndarray, stage: int, stages_total: int) -> np.ndarray:
+    """
+    Ensure inputs carry a stage indicator as the last channel. baseline stays in channel 0.
+    Stage value is normalized to [0,1] when multiple stages are used.
+    """
+    stage_val = float(stage) / float(max(stages_total - 1, 1))
+    # If there's only the baseline channel, append stage; otherwise, overwrite last channel.
+    if inputs.shape[-1] == 1:
+        stage_plane = np.full_like(inputs, stage_val)
+        return np.concatenate([inputs, stage_plane], axis=-1)
+    out = inputs.copy()
+    out[..., -1] = stage_val
+    return out
 
 
 def build_estimator(args):
@@ -150,6 +166,8 @@ def main():
             if args.verbose:
                 print(f"\n--- Building dataset for stage {stage} from previous model ---")
             inputs, residuals, targets = refine_dataset_with_model(estimator, inputs, targets)
+        # Tag inputs with the current stage so the model can condition on refinement depth.
+        inputs = _set_stage_channel(inputs, stage=stage, stages_total=int(args.stages))
 
         X_train, X_val, y_train, y_val, t_train, t_val = train_test_split(
             inputs,
