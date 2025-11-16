@@ -1,0 +1,35 @@
+{
+  "stages": [
+    {
+      "stage": 0,
+      "val_ratio": 0.9448071718215942,
+      "baseline_mae": 0.6280593872070312,
+      "refined_mae": 0.5933949947357178,
+      "checkpoint": "estimator_stage0.pt"
+    }
+  ],
+  "args": {
+    "out_dir": "runs\\wave_resnet",
+    "stages": 1,
+    "num_samples": 4,
+    "min_len": 8,
+    "max_len": 20,
+    "noise_std": 0.2,
+    "alphabet": "",
+    "save_dataset": "",
+    "epochs": 60,
+    "batch_size": 16,
+    "lr": 0.0003,
+    "val_frac": 0.2,
+    "conv_channels": 32,
+    "kernel_size": 3,
+    "hidden_layers": 4,
+    "hidden_units": 64,
+    "attention_heads": 0,
+    "seed": 42,
+    "device": "auto",
+    "patience": 24,
+    "early_stopping": true,
+    "verbose": 1
+  }
+}

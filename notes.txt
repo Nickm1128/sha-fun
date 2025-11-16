@@ -1,0 +1,91 @@
+Ok so this can be our idea.
+
+Two sine-activated models
+
+1. Accepts the output hash, returns the state evolution.
+
+2. Accepts the output hash and the predicted state from the first model. Returns a new predicted state evolution.
+
+3. Tree-search sort of algo which accepts the second model's output as a search-space reducer.
+
+---
+Comprehensive TODO to test the idea end-to-end
+
+Scope and simplifying assumptions
+- Restrict messages to a single SHA-256 block after padding (short messages) to keep dependency surface small.
+- Fix a small alphabet (e.g., [a–z, A–Z, 0–9, space]) and a short length range (e.g., 8–20 chars) for search-time feasibility.
+- Target predicting the per-round working-state evolution for the first compression block only.
+
+Data and instrumentation
+- Add a utility to produce full per-round state evolution for the first block of a message.
+  - Reuse `sha256_compress_with_states` in `utils.py`; add a wrapper that:
+    - Pads the message, extracts the first 64-byte block, and collects 64 rounds of states (8 words each) and W[t].
+    - Returns normalized float arrays suitable for ML (e.g., map 32-bit ints to [-1,1] via / 2^31).
+- Define featureization for the output hash H (256-bit):
+  - Start simple: concatenate 8 uint32 words normalized to [-1,1]. Optionally add positional/Fourier features.
+- Dataset spec for Model 1 (state predictor):
+  - X: features from final hash H only.
+  - Y: per-round working states: shape (64, 8). Optionally exclude W[t] from the target for now.
+  - Serialize datasets to disk (`.npz` or CSV) with train/val/test splits.
+- Update `data_generator.py` to build this dataset at scale (configurable N), with progress logging and saving to `data/`.
+
+Models
+- Model 1: Sine-activated state predictor (H -> S[0..63]).
+  - Implement a small SIREN-like MLP (sine activations) in `models.py`:
+    - Input dim = 8 (hash words) or expanded features.
+    - Output dim = 64*8; reshape to (64,8) at the end.
+    - Loss: L1 or smooth L1 on normalized states; metric: MAE.
+    - Regularization: dropout on hidden or weight decay; early stopping on val MAE.
+- Model 2: Refinement network (H, S_pred -> S_refined).
+  - Concatenate H features with flattened S_pred; output same shape as Model 1.
+  - Train on (H, S_pred_from_model1_noised) -> S_true with teacher-forcing (optionally add noise to S_pred).
+  - Use same loss/metrics as Model 1.
+
+Training pipeline
+- Create `train_state_models.py`:
+  - CLI args for data path, batch size, lr, epochs, seeds, output dir.
+  - Train/validate Model 1; save best weights and scaler metadata.
+  - Freeze Model 1 inference to generate S_pred for train/val; train Model 2; save best weights.
+  - Log curves and final metrics; persist configs and seeds for reproducibility.
+
+Search prototype (beam search over messages)
+- Scoring function:
+  - For a candidate partial message (prefix), compute partial SHA schedule/state for rounds/bytes influenced by known prefix.
+  - Compare to Model 2 refined states (e.g., MAE over the subset of rounds deemed reliable) to get a compatibility score.
+- Beam search loop:
+  - Beam width b (e.g., 64), depth = target length L.
+  - At each step, expand each prefix by top-k characters from the allowed alphabet; prune to best b using the scoring function.
+  - When a complete candidate is formed, check if its final hash equals target H; stop when found or after budget exhausted.
+- Implement `search.py` with a simple, parallelizable beam; add time/step budgets.
+
+Evaluation plan
+- Data quality: verify state extraction matches reference SHA-256 for a sample set; add unit tests for `utils` functions.
+- Model quality: report MAE per-round and per-variable; compare L1 vs smooth L1 losses; ablation on sine vs ReLU.
+- Search effectiveness under constraints: success rate, average expansions, time to find exact match for varying lengths and beam widths.
+- Baselines: unguided random/beam search; heuristic scoring using only H without ML guidance.
+
+Engineering tasks
+- `utils.py`:
+  - Add `message_to_first_block_states(message: str) -> (states[64,8], H[8])` with normalization utilities.
+  - Add `hash_to_features(H[8]) -> features[d]` and inverse/scale metadata.
+  - Add quick unit tests for padding, schedule, and state evolution equivalence vs known vectors.
+- `models.py`:
+  - Add `SineStatePredictor` (Model 1) and `SineStateRefiner` (Model 2) classes with `.build()` helpers.
+  - Keep existing `SinePolicyMultiAsset` intact; new classes should be self-contained.
+- `data_generator.py`:
+  - New path: `GenerateStateDataset(N, out_dir, splits)` producing train/val/test `.npz` with X, Y.
+- New scripts:
+  - `train_state_models.py`, `search.py`, and a small `eval_search.py` to batch-run trials and summarize.
+- Repo hygiene: add `requirements.txt`, `data/` and `runs/` dirs to `.gitignore`; seed control; simple README section on how to run.
+
+Risks and notes
+- This does not break SHA-256; experiments are toy and rely on heavy constraints and learned priors.
+- If state targets prove too hard, try predicting a coarser target first (e.g., per-round sign bits or low-res averages), then iterate.
+- If beam scoring is too slow, cache and vectorize partial state computations; consider batching with NumPy.
+
+Next immediate steps
+1) Implement `message_to_first_block_states` + tests in `utils.py`.
+2) Build a small dataset (e.g., 10k samples) and verify shapes/stats.
+3) Implement `SineStatePredictor` and train to a reasonable MAE.
+4) Add `SineStateRefiner`, train with frozen Model 1 outputs.
+5) Prototype `search.py` for very short strings (e.g., 6–8 chars) and measure success under tight budgets.

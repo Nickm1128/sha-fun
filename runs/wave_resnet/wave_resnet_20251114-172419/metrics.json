@@ -1,0 +1,28 @@
+{
+  "val_ratio": 1.0099756717681885,
+  "baseline_mae": 0.21710586547851562,
+  "refined_mae": 0.21926318109035492,
+  "args": {
+    "out_dir": "runs\\wave_resnet",
+    "num_samples": 10000,
+    "min_len": 8,
+    "max_len": 20,
+    "noise_std": 0.3,
+    "alphabet": "",
+    "save_dataset": "",
+    "epochs": 60,
+    "batch_size": 64,
+    "lr": 0.0003,
+    "val_frac": 0.2,
+    "conv_channels": 48,
+    "kernel_size": 3,
+    "hidden_layers": 8,
+    "hidden_units": 96,
+    "attention_heads": 4,
+    "seed": 42,
+    "device": "auto",
+    "patience": 8,
+    "early_stopping": true,
+    "verbose": 1
+  }
+}
