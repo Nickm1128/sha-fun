@@ -80,9 +80,15 @@ def refine_dataset_with_model(estimator, inputs, targets):
 
 
 def build_estimator(args):
+    # psann 0.10.x does not accept an attention kwarg; newer versions might.
+    # Probe the signature at runtime to stay compatible.
+    import inspect
+
+    supports_attention = "attention" in inspect.signature(WaveResNetRegressor.with_conv_stem).parameters
     attention = None
-    if args.attention_heads > 0:
+    if supports_attention and args.attention_heads > 0:
         attention = {"kind": "mha", "num_heads": int(args.attention_heads)}
+
     return WaveResNetRegressor.with_conv_stem(
         conv_channels=int(args.conv_channels),
         conv_kernel_size=int(args.kernel_size),
@@ -95,10 +101,10 @@ def build_estimator(args):
         loss=relative_mae_loss,
         random_state=int(args.seed),
         device=args.device,
-        attention=attention,
         output_shape=(64, 8),
         early_stopping=bool(args.early_stopping),
         patience=int(args.patience),
+        **({"attention": attention} if supports_attention else {}),
     )
 
 
