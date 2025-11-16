@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+import math
 
 import numpy as np
 import torch
@@ -80,19 +81,29 @@ def refine_dataset_with_model(estimator, inputs, targets):
     return new_inputs, new_residuals, targets
 
 
-def _set_stage_channel(inputs: np.ndarray, stage: int, stages_total: int) -> np.ndarray:
+def _encode_stage_embed(stage: int, stages_total: int, embed_dim: int = 4) -> np.ndarray:
     """
-    Ensure inputs carry a stage indicator as the last channel. baseline stays in channel 0.
-    Stage value is normalized to [0,1] when multiple stages are used.
+    Build a small embedding vector for the given stage index.
+    Uses simple scalar + sinusoidal features; pads/truncates to embed_dim.
     """
-    stage_val = float(stage) / float(max(stages_total - 1, 1))
-    # If there's only the baseline channel, append stage; otherwise, overwrite last channel.
-    if inputs.shape[-1] == 1:
-        stage_plane = np.full_like(inputs, stage_val)
-        return np.concatenate([inputs, stage_plane], axis=-1)
-    out = inputs.copy()
-    out[..., -1] = stage_val
-    return out
+    s = float(stage) / float(max(stages_total - 1, 1))
+    feats = [s, math.sin(math.pi * s), math.cos(math.pi * s), s * s]
+    if embed_dim <= len(feats):
+        return np.asarray(feats[:embed_dim], dtype=np.float32)
+    # pad with zeros if more dims requested
+    feats.extend([0.0] * (embed_dim - len(feats)))
+    return np.asarray(feats, dtype=np.float32)
+
+
+def _set_stage_channel(inputs: np.ndarray, stage: int, stages_total: int, embed_dim: int = 1) -> np.ndarray:
+    """
+    Ensure inputs carry a stage indicator/embedding as extra channels. baseline stays in channel 0.
+    Stage value is normalized to [0,1] and optionally expanded with sinusoidal features.
+    """
+    stage_vec = _encode_stage_embed(stage, stages_total, embed_dim=embed_dim)
+    # Broadcast per-sample stage embedding across spatial dims
+    stage_planes = np.tile(stage_vec, (inputs.shape[0], inputs.shape[1], inputs.shape[2], 1))
+    return np.concatenate([inputs, stage_planes.astype(inputs.dtype)], axis=-1)
 
 
 def build_estimator(args):
@@ -128,6 +139,9 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Train a WaveResNet refiner on SHA-256 evolution maps.")
     ap.add_argument("--out_dir", type=str, default=os.path.join("runs", "wave_resnet"))
     ap.add_argument("--stages", type=int, default=1, help="Number of iterative refinement stages to train.")
+    ap.add_argument("--stage_embed_dim", type=int, default=4, help="Embedding dims for stage conditioning channels.")
+    ap.add_argument("--cache_dataset", type=str, default="", help="Optional .npz to load/save generated stage-0 dataset.")
+    ap.add_argument("--pooled_after", action="store_true", help="Also train a pooled final model on all stage datasets.")
     ap.add_argument("--num_samples", type=int, default=2000)
     ap.add_argument("--min_len", type=int, default=8)
     ap.add_argument("--max_len", type=int, default=20)
@@ -157,17 +171,39 @@ def main():
     run_dir = os.path.join(args.out_dir, f"wave_resnet_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
-    inputs, residuals, targets = build_dataset(args)
+    # Optionally load cached stage-0 dataset to speed up iterations.
+    if args.cache_dataset and os.path.isfile(args.cache_dataset):
+        with np.load(args.cache_dataset) as data:
+            inputs, residuals, targets = data["inputs"], data["residuals"], data["targets"]
+        if args.verbose:
+            print(f"Loaded cached dataset from {args.cache_dataset} (inputs {inputs.shape})")
+    else:
+        inputs, residuals, targets = build_dataset(args)
+        if args.cache_dataset:
+            np.savez_compressed(args.cache_dataset, inputs=inputs, residuals=residuals, targets=targets)
+            if args.verbose:
+                print(f"Cached stage-0 dataset to {args.cache_dataset}")
+
     estimator = None
     stage_metrics = []
+    pooled_inputs = []
+    pooled_residuals = []
+    pooled_targets = []
 
     for stage in range(int(args.stages)):
         if stage > 0:
             if args.verbose:
                 print(f"\n--- Building dataset for stage {stage} from previous model ---")
             inputs, residuals, targets = refine_dataset_with_model(estimator, inputs, targets)
-        # Tag inputs with the current stage so the model can condition on refinement depth.
-        inputs = _set_stage_channel(inputs, stage=stage, stages_total=int(args.stages))
+        # Tag inputs with the current stage embedding so the model can condition on refinement depth.
+        inputs = _set_stage_channel(
+            inputs, stage=stage, stages_total=int(args.stages), embed_dim=int(args.stage_embed_dim)
+        )
+
+        if args.pooled_after:
+            pooled_inputs.append(inputs)
+            pooled_residuals.append(residuals)
+            pooled_targets.append(targets)
 
         X_train, X_val, y_train, y_val, t_train, t_val = train_test_split(
             inputs,
@@ -225,6 +261,50 @@ def main():
         json.dump(metrics, fh, indent=2)
     if args.verbose:
         print(f"\nSaved multi-stage checkpoints and metrics in {run_dir}")
+
+    # Optional pooled final model across all stages
+    if args.pooled_after and pooled_inputs:
+        if args.verbose:
+            print("\n=== Training pooled model across all stages ===")
+        pooled_inputs_arr = np.concatenate(pooled_inputs, axis=0)
+        pooled_residuals_arr = np.concatenate(pooled_residuals, axis=0)
+        pooled_targets_arr = np.concatenate(pooled_targets, axis=0)
+
+        X_train, X_val, y_train, y_val, t_train, t_val = train_test_split(
+            pooled_inputs_arr,
+            pooled_residuals_arr,
+            pooled_targets_arr,
+            test_size=args.val_frac,
+            random_state=args.seed,
+            shuffle=True,
+        )
+
+        pooled_estimator = build_estimator(args)
+        pooled_estimator.fit(
+            X_train,
+            y_train,
+            validation_data=(X_val, y_val),
+            verbose=int(args.verbose),
+        )
+        val_ratio, baseline_mae, refined_mae = evaluate_refinement(pooled_estimator, X_val, t_val)
+        pooled_ckpt = os.path.join(run_dir, "estimator_pooled.pt")
+        pooled_estimator.save(pooled_ckpt)
+        pooled_metrics = {
+            "stage": "pooled",
+            "val_ratio": val_ratio,
+            "baseline_mae": baseline_mae,
+            "refined_mae": refined_mae,
+            "checkpoint": os.path.basename(pooled_ckpt),
+        }
+        stage_metrics.append(pooled_metrics)
+        metrics["stages"] = stage_metrics
+        with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as fh:
+            json.dump(metrics, fh, indent=2)
+        if args.verbose:
+            print(
+                f"Pooled model validation relative MAE: {val_ratio:.4f} "
+                f"(baseline {baseline_mae:.4f} -> refined {refined_mae:.4f})"
+            )
 
 
 if __name__ == "__main__":
